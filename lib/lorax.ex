@@ -72,6 +72,7 @@ defmodule Lorax do
   """
 
   import Nx.Defn
+  alias Lorax.QLoRA.Target, as: QLoRATarget
 
   defmodule Config do
     @moduledoc """
@@ -107,6 +108,10 @@ defmodule Lorax do
 
     `target_key` specifies whether to apply LoRA to all key matrices in an
     attention block. Defaults to true.
+
+    `qlora_targets` specifies a map keyed by target layer name, containing
+    `%Lorax.QLoRA.Target{}` definitions for QLoRA execution.
+    If provided, every selected target node must have an entry.
     """
     defstruct r: 1,
               alpha: 2,
@@ -116,7 +121,8 @@ defmodule Lorax do
               target_query: true,
               target_key: true,
               target_value: true,
-              target_node_fn: nil
+              target_node_fn: nil,
+              qlora_targets: %{}
   end
 
   @doc """
@@ -166,10 +172,12 @@ defmodule Lorax do
   """
   def inject(%Axon{} = axon, %Config{} = config) do
     target_nodes = get_target_nodes(axon, config)
+    qlora_targets = Lorax.QLoRA.validate_targets!(axon, target_nodes, config.qlora_targets)
 
     Enum.reduce(target_nodes, axon, fn target_id, %Axon{nodes: acc_nodes} = acc ->
       # Grab our target node, create a fake Axon container for it
       %Axon.Node{} = target_node = Map.fetch!(acc_nodes, target_id)
+      target_name = node_name(target_node)
       target_axon = %Axon{acc | output: target_id}
 
       # Get its parent and create fake Axon containers
@@ -183,8 +191,27 @@ defmodule Lorax do
 
       # lora node takes target's place
       # target node takes dummy's place
-      lora_node = create_lora_node(target_node, parent_axons, dummy_axon, config)
-      lora_node = %Axon.Node{lora_node | id: target_id}
+      injected_node =
+        case Map.get(qlora_targets, target_name) do
+          nil ->
+            {create_lora_node(target_node, parent_axons, dummy_axon, config), %{}}
+
+          %QLoRATarget{} = qlora_target ->
+            %Axon{output: injected_id, nodes: injected_nodes} =
+              create_qlora_node(target_node, parent_axons, dummy_axon, config, qlora_target)
+
+            %Axon.Node{} = injected_node = injected_nodes[injected_id]
+
+            extra_nodes =
+              injected_nodes
+              |> Map.drop(Map.keys(acc_nodes))
+              |> Map.delete(injected_id)
+
+            {injected_node, extra_nodes}
+        end
+
+      {injected_node, extra_nodes} = injected_node
+      injected_node = %Axon.Node{injected_node | id: target_id}
       target_node = %Axon.Node{target_node | id: dummy_id}
 
       # update Axon container's map of nodes so that
@@ -192,7 +219,8 @@ defmodule Lorax do
       # 2. whenever lora node references dummy id, it'll take the output value (Wx) from target
       new_nodes =
         acc_nodes
-        |> Map.put(target_id, lora_node)
+        |> Map.merge(extra_nodes)
+        |> Map.put(target_id, injected_node)
         |> Map.put(dummy_id, target_node)
 
       %Axon{acc | nodes: new_nodes}
@@ -270,6 +298,91 @@ defmodule Lorax do
     end)
   end
 
+  defp create_qlora_node(
+         %Axon.Node{op: :conv, name: target_name_fn, opts: opts},
+         parent_axons,
+         _dummy_axon,
+         %Config{
+           r: r,
+           alpha: alpha,
+           dropout: dropout,
+           dropout_seed: dropout_seed,
+           param_type: param_type
+         },
+         %QLoRATarget{
+           packed_weight: packed_weight,
+           provider: provider,
+           provider_opts: provider_opts,
+           base_bias: base_bias,
+           base_type: base_type
+         }
+       ) do
+    scaling = alpha / r
+    dropout_seed = dropout_seed || :erlang.system_time()
+
+    {a_shape, b_shape} = calc_qlora_ab_from_packed!(:conv, r, packed_weight)
+
+    packed_weight = create_fixed_state_param("packed_weight", packed_weight)
+    base_bias = create_base_bias_param(base_bias, base_type)
+    lora_A = Axon.param("lora_down", a_shape, initializer: :normal, type: param_type)
+    lora_B = Axon.param("lora_up", b_shape, initializer: :zeros, type: param_type)
+    lora_name_fn = create_name_fn(target_name_fn)
+
+    Axon.layer(&qlora_conv_impl/6, parent_axons ++ [packed_weight, base_bias, lora_A, lora_B],
+      op_name: :qlora,
+      name: lora_name_fn,
+      dropout: dropout,
+      dropout_seed: dropout_seed,
+      provider: provider,
+      provider_opts: provider_opts,
+      base_type: base_type,
+      layer_opts: opts,
+      scaling: scaling
+    )
+  end
+
+  defp create_qlora_node(
+         %Axon.Node{op: :dense, name: target_name_fn},
+         parent_axons,
+         _dummy_axon,
+         %Config{
+           r: r,
+           alpha: alpha,
+           dropout: dropout,
+           dropout_seed: dropout_seed,
+           param_type: param_type
+         },
+         %QLoRATarget{
+           packed_weight: packed_weight,
+           provider: provider,
+           provider_opts: provider_opts,
+           base_bias: base_bias,
+           base_type: base_type
+         }
+       ) do
+    scaling = alpha / r
+    dropout_seed = dropout_seed || :erlang.system_time()
+
+    {a_shape, b_shape} = calc_qlora_ab_from_packed!(:dense, r, packed_weight)
+
+    packed_weight = create_fixed_state_param("packed_weight", packed_weight)
+    base_bias = create_base_bias_param(base_bias, base_type)
+    lora_A = Axon.param("lora_down", a_shape, initializer: :normal, type: param_type)
+    lora_B = Axon.param("lora_up", b_shape, initializer: :zeros, type: param_type)
+    lora_name_fn = create_name_fn(target_name_fn)
+
+    Axon.layer(&qlora_dense_impl/6, parent_axons ++ [packed_weight, base_bias, lora_A, lora_B],
+      op_name: :qlora,
+      name: lora_name_fn,
+      dropout: dropout,
+      dropout_seed: dropout_seed,
+      provider: provider,
+      provider_opts: provider_opts,
+      base_type: base_type,
+      scaling: scaling
+    )
+  end
+
   defnp lora_conv_impl(x, wx, lora_A, lora_B, opts \\ []) do
     scaling = opts[:scaling]
     layer_opts = opts[:layer_opts]
@@ -293,12 +406,107 @@ defmodule Lorax do
     Nx.add(wx, bax)
   end
 
+  defnp qlora_dense_impl(x, packed_weight, base_bias, lora_A, lora_B, opts \\ []) do
+    dropout = opts[:dropout]
+    dropout_seed = opts[:dropout_seed]
+    scaling = opts[:scaling]
+    provider = opts[:provider]
+    provider_opts = opts[:provider_opts]
+    base_type = opts[:base_type]
+
+    dequantized_weight =
+      provider.dequant(packed_weight, provider_opts)
+      |> Nx.as_type(base_type)
+      |> Nx.Defn.Kernel.stop_grad()
+
+    frozen_base_bias =
+      base_bias
+      |> Nx.as_type(base_type)
+      |> Nx.Defn.Kernel.stop_grad()
+
+    wx = Axon.Layers.dense(x, dequantized_weight, frozen_base_bias)
+
+    x = Axon.Layers.dropout(x, Nx.Random.key(dropout_seed), rate: dropout)
+    after_a = Axon.Layers.dense(x, lora_A |> Nx.transpose())
+    after_b = Nx.dot(after_a, lora_B |> Nx.transpose())
+    bax = Nx.multiply(after_b, scaling)
+
+    Nx.add(wx, bax)
+  end
+
+  defnp qlora_conv_impl(x, packed_weight, base_bias, lora_A, lora_B, opts \\ []) do
+    scaling = opts[:scaling]
+    layer_opts = opts[:layer_opts]
+    provider = opts[:provider]
+    provider_opts = opts[:provider_opts]
+    base_type = opts[:base_type]
+
+    dequantized_weight =
+      provider.dequant(packed_weight, provider_opts)
+      |> Nx.as_type(base_type)
+      |> Nx.Defn.Kernel.stop_grad()
+
+    frozen_base_bias =
+      base_bias
+      |> Nx.as_type(base_type)
+      |> Nx.Defn.Kernel.stop_grad()
+
+    wx = Axon.Layers.conv(x, dequantized_weight, frozen_base_bias, layer_opts)
+    after_a = Axon.Layers.conv(x, lora_A, layer_opts)
+    after_b = Axon.Layers.conv(after_a, lora_B)
+    bax = Nx.multiply(after_b, scaling)
+
+    Nx.add(wx, bax)
+  end
+
+  defp create_base_bias_param(nil, base_type) do
+    create_fixed_state_param("base_bias", Nx.tensor(0, type: base_type))
+  end
+
+  defp create_base_bias_param(%Nx.Tensor{} = base_bias, _base_type) do
+    create_fixed_state_param("base_bias", base_bias)
+  end
+
+  defp create_fixed_state_param(name, %Nx.Tensor{} = tensor) do
+    Axon.param(name, Nx.shape(tensor),
+      type: Nx.type(tensor),
+      kind: :state,
+      initializer: fn _shape, _type, _key -> tensor end
+    )
+  end
+
+  defp calc_qlora_ab_from_packed!(:dense, r, %Nx.Tensor{} = packed_weight) do
+    case Nx.shape(packed_weight) do
+      {in_features, out_features} ->
+        {{r, in_features}, {out_features, r}}
+
+      shape ->
+        raise ArgumentError,
+              "QLoRA dense packed weight must be rank-2, got shape #{inspect(shape)}"
+    end
+  end
+
+  defp calc_qlora_ab_from_packed!(:conv, r, %Nx.Tensor{} = packed_weight) do
+    case Nx.shape(packed_weight) do
+      {kernel_h, kernel_w, in_features, out_features} ->
+        {{kernel_h, kernel_w, in_features, r}, {1, 1, r, out_features}}
+
+      shape ->
+        raise ArgumentError,
+              "QLoRA conv packed weight must be rank-4, got shape #{inspect(shape)}"
+    end
+  end
+
   defp create_name_fn(target_name_fn) do
     fn op, op_count ->
       target_name = target_name_fn.(op, op_count)
 
       "lora_" <> target_name
     end
+  end
+
+  defp node_name(%Axon.Node{name: name_fn}) do
+    name_fn.(nil, nil)
   end
 
   defp get_target_nodes(axon, %Config{target_node_fn: target_node_fn})

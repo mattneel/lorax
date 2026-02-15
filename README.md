@@ -80,6 +80,40 @@ Text Generation
 
 For more details on configuring LoRA hyperparameters, see this [post](https://lightning.ai/pages/community/lora-insights/) by Sebastian Raschka.
 
+## QLoRA
+
+`Lorax` supports a generalized QLoRA path via `qlora_targets` in `Lorax.Config`.
+Each selected target layer (by name) receives:
+
+- packed base weight tensor (typically `{:u, 8}`)
+- dequant provider module (`Lorax.QLoRA.Provider`)
+- optional provider options
+- optional base bias tensor
+
+The QLoRA forward path is:
+
+`y = x * stop_grad(dequant(packed_w)) + LoRA(x, A, B, alpha/r)`
+
+Only LoRA adapters are trainable; base quantized weights are never trainable.
+
+```elixir
+defmodule MyDequant do
+  @behaviour Lorax.QLoRA.Provider
+  def dequant(packed_weight, _opts), do: Nx.as_type(packed_weight, {:f, 32})
+end
+
+config = %Lorax.Config{
+  qlora_targets: %{
+    "query" => %Lorax.QLoRA.Target{
+      packed_weight: packed_query,
+      provider: MyDequant,
+      provider_opts: %{},
+      base_bias: query_bias
+    }
+  }
+}
+```
+
 ## Testing
 
 Run the default unit + CPU smoke suite:
@@ -119,4 +153,4 @@ If EXLA or CUDA runtime is not configured, leave `LORAX_TEST_EXLA` unset and the
 
 2. Fine-Tuning Speed: The training speed of this library isn't on par with Huggingface's PEFT library. Further optimizations can be done to close the gap.
 
-Note: For minor fine-tuning tasks without a GPU, the BinaryBackend is a viable option, often resulting in smoother training runs. Future updates will focus on minimizing GPU memory usage by reducing the amount of tensors stored during training, and potentially a QLoRA implementation one day.
+Note: For minor fine-tuning tasks without a GPU, the BinaryBackend is a viable option, often resulting in smoother training runs. Future updates will focus on minimizing GPU memory usage by reducing the amount of tensors stored during training and expanding QLoRA integrations.
