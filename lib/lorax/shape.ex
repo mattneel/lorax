@@ -47,7 +47,7 @@ defmodule Lorax.Shape do
     shape_fn = get_kernel_shape_fn(parameters)
 
     {kernel_size, _kernel_size, _input_channels, output_filters} =
-      shape_fn.({nil, nil, nil, @dummy_in_features})
+      shape_fn.({1, 1, 1, @dummy_in_features})
 
     a_shape_fn = fn x_shape, _wx_shape ->
       rank = Nx.rank(x_shape)
@@ -63,11 +63,21 @@ defmodule Lorax.Shape do
   end
 
   defp get_kernel_shape_fn(parameters) do
-    %Axon.Parameter{shape: shape_fn} =
+    %Axon.Parameter{} =
+      kernel_param =
       Enum.find(parameters, fn %Axon.Parameter{name: name} ->
         name == "kernel"
       end)
 
-    shape_fn
+    case kernel_param do
+      %Axon.Parameter{shape: shape_fn} when is_function(shape_fn, 1) ->
+        shape_fn
+
+      %Axon.Parameter{template: template_fn} when is_function(template_fn, 1) ->
+        fn input_shape ->
+          template_fn.(input_shape)
+          |> Nx.shape()
+        end
+    end
   end
 end

@@ -80,6 +80,39 @@ Text Generation
 
 For more details on configuring LoRA hyperparameters, see this [post](https://lightning.ai/pages/community/lora-insights/) by Sebastian Raschka.
 
+## Testing
+
+Run the default unit + CPU smoke suite:
+
+```bash
+mix test
+```
+
+Run the optional EXLA smoke test (useful for CUDA/GPU setups):
+
+```bash
+LORAX_TEST_EXLA=1 mix test --include gpu
+```
+
+For WSL2 + CUDA 12/13 environments, first build EXLA/XLA for CUDA and verify that `:cuda` is detected:
+
+```bash
+./scripts/setup_exla_cuda12.sh
+```
+
+Then run the GPU smoke test:
+
+```bash
+./scripts/gpu_smoke_test.sh
+```
+
+Notes:
+- `scripts/setup_exla_cuda12.sh` sets `XLA_TARGET=cuda12` by default (override with env var).
+- If required CUDA12 runtime libs are missing, setup auto-installs user-space NVIDIA wheels via `python3 -m pip --user` (cudart, cublas, cudnn, nccl, etc.).
+- Override paths if needed: `CUDA_LIB_DIR=... NCCL_LIB_DIR=... ./scripts/setup_exla_cuda12.sh`.
+
+If EXLA or CUDA runtime is not configured, leave `LORAX_TEST_EXLA` unset and the GPU test will skip.
+
 ## Limitations
 
 1. GPU Memory Requirements: Although LoRA reduces the GPU requirements for fine-tuning, larger LLMs beyond GPT2 still demand GPUs with substantial vRAM. Inadequate memory management can lead to cuda OOM crashes.

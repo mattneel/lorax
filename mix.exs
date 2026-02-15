@@ -24,10 +24,11 @@ defmodule Lorax.MixProject do
 
   defp deps do
     [
-      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
-      {:axon, "~> 0.6.1"},
-      {:nx, "~> 0.7.1"},
-      {:kino, "~> 0.12.3"},
+      {:ex_doc, "~> 0.40.1", only: :dev, runtime: false},
+      {:axon, "~> 0.8.0"},
+      {:nx, "~> 0.10.0"},
+      {:kino, "~> 0.18.0"},
+      {:exla, "~> 0.10.0", only: :test, runtime: false},
       {:safetensors, "~> 0.1.3"}
     ]
   end
