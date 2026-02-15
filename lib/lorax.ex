@@ -169,7 +169,7 @@ defmodule Lorax do
 
     Enum.reduce(target_nodes, axon, fn target_id, %Axon{nodes: acc_nodes} = acc ->
       # Grab our target node, create a fake Axon container for it
-      target_node = acc_nodes[target_id]
+      %Axon.Node{} = target_node = Map.fetch!(acc_nodes, target_id)
       target_axon = %Axon{acc | output: target_id}
 
       # Get its parent and create fake Axon containers
